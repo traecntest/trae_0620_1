@@ -50,12 +50,25 @@ class ShutdownManager:
         return ok, msg, "ok" if ok else "err"
 
     def cancel(self):
-        """取消所有由本工具设置的关机任务。"""
-        self._run_raw(["shutdown", "/a"])
-        self.cancel_daily()
+        """取消所有由本工具设置的关机任务。
+
+        返回 (ok, msg)。
+        """
+        ok1, msg1 = self._run_raw(["shutdown", "/a"])
+        ok2, msg2 = self.cancel_daily()
+        if ok1 or ok2:
+            return True, "已取消所有关机任务"
+        return False, "取消失败：" + (msg1 if msg1 else msg2)
 
     def cancel_daily(self):
-        self._run_raw(["schtasks", "/Delete", "/TN", self.DAILY_TASK_NAME, "/F"])
+        """取消每日循环关机计划任务。
+
+        返回 (ok, msg)。
+        """
+        ok, msg = self._run_raw(["schtasks", "/Delete", "/TN", self.DAILY_TASK_NAME, "/F"])
+        if not ok and "找不到" in msg:
+            return True, "当前没有每日关机任务"
+        return ok, msg
 
     @staticmethod
     def _valid_time(time_str):
