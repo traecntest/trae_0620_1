@@ -1,0 +1,12 @@
+# C 盘清理小工具
+# 本工具仅使用 Python 标准库，无需安装任何第三方依赖。
+# 运行需要 Python 3.8+（建议 3.10 及以上）。
+#
+# 直接运行：
+#   python main.py
+#
+# 后台静默运行（无控制台窗口）：
+#   pythonw main.py
+#
+# 可选：如需打包为 exe（非必须），可安装 PyInstaller：
+#   pip install pyinstaller
