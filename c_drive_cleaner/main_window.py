@@ -77,6 +77,13 @@ class MainWindow:
                                     command=self._on_clean)
         self.btn_clean.pack(fill="x", ipady=4)
 
+        ctrl_frame = ttk.Frame(clean_frame)
+        ctrl_frame.pack(fill="x", pady=(6, 0))
+        self.btn_pause = ttk.Button(ctrl_frame, text="暂停", command=self._on_pause_toggle, state="disabled")
+        self.btn_pause.pack(side="left", fill="x", expand=True)
+        self.btn_cancel = ttk.Button(ctrl_frame, text="取消", command=self._on_cancel_clean, state="disabled")
+        self.btn_cancel.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
         shut_frame = ttk.LabelFrame(self.root, text="定时关机", padding=8)
         shut_frame.pack(fill="x", **pad)
 
@@ -175,39 +182,98 @@ class MainWindow:
         if not self._require_unlock():
             return
         self.busy = True
+        self.cleaner.reset()
         self.btn_clean.config(state="disabled", text="清理中...")
+        self.btn_pause.config(state="normal", text="暂停")
+        self.btn_cancel.config(state="normal")
         threading.Thread(target=self._clean_worker, daemon=True).start()
+
+    def _on_pause_toggle(self):
+        if not self.busy:
+            return
+        if self.cleaner.is_paused():
+            self.cleaner.resume()
+            self.btn_pause.config(text="暂停")
+            self.log("已继续清理", "info")
+        else:
+            self.cleaner.pause()
+            self.btn_pause.config(text="继续")
+            self.log("已暂停清理，可随时继续或取消", "info")
+
+    def _on_cancel_clean(self):
+        if not self.busy:
+            return
+        self.cleaner.cancel()
+        self.btn_pause.config(state="disabled")
+        self.btn_cancel.config(state="disabled")
+        self.log("正在取消清理，请稍候...", "warn")
 
     def _clean_worker(self):
         try:
             self._emit("正在扫描可清理项目...", "info")
             before = self.cleaner.scan()
-            self._emit("扫描完成，预计可释放：{}".format(ConfigManager.human_size(before)), "ok")
+            self._emit("扫描完成，共 {} 项，预计可释放 {}".format(
+                len(self.cleaner.category_results), ConfigManager.human_size(before)), "ok")
+
+            self._emit_category_scan_summary()
+
             if before <= 0:
                 self._emit("C 盘已经很干净，无需清理", "info")
                 return
 
             freed, count, errors = self.cleaner.clean(progress_callback=self._progress_cb)
-            self._emit("清理完成：释放 {}，处理 {} 项".format(
-                ConfigManager.human_size(freed), count), "ok")
+
+            cancelled = self.cleaner.is_cancelled()
+
+            if cancelled:
+                self._emit("清理已取消", "warn")
+            else:
+                self._emit("清理完成：释放 {}，处理 {} 项".format(
+                    ConfigManager.human_size(freed), count), "ok")
+            self._emit_category_clean_summary()
+
             if errors:
                 self._emit("部分项目已跳过（多为文件被占用或需管理员权限）：", "warn")
                 for e in errors[:20]:
                     self._emit("  · " + e, "warn")
-            self.config.record_cleanup(freed)
-            self.root.after(0, self._refresh_status)
+
+            if not cancelled and freed > 0:
+                self.config.record_cleanup(freed)
+                self.root.after(0, self._refresh_status)
         except Exception as e:
             self._emit("清理出错：" + str(e), "err")
         finally:
             self.root.after(0, self._clean_done)
 
-    def _progress_cb(self, name, delta):
+    def _emit_category_scan_summary(self):
+        summary = self.cleaner.get_category_summary()
+        if not summary:
+            return
+        self._emit("  分类扫描结果：", "info")
+        for name, data in summary.items():
+            self._emit("    · {}：{}".format(name, ConfigManager.human_size(data["before"])), "info")
+
+    def _emit_category_clean_summary(self):
+        summary = self.cleaner.get_category_summary()
+        if not summary:
+            return
+        self._emit("  分类清理结果：", "info")
+        status_map = {"done": "完成", "skipped": "跳过", "error": "出错",
+                       "cancelled": "已取消", "pending": "待处理"}
+        for name, data in summary.items():
+            status_text = status_map.get(data["status"], data["status"])
+            self._emit("    · {}：释放 {} / {} 项 [{}]".format(
+                name, ConfigManager.human_size(data["freed"]), data["count"], status_text), "info")
+
+    def _progress_cb(self, name, delta, count):
         if delta > 0:
             self._emit("  已清理 {}：{}".format(name, ConfigManager.human_size(delta)), "info")
 
     def _clean_done(self):
         self.busy = False
         self.btn_clean.config(state="normal", text="一键清理 C 盘")
+        self.btn_pause.config(state="disabled", text="暂停")
+        self.btn_cancel.config(state="disabled")
 
     # ---------------- 关机 ----------------
     def _on_mode_change(self):
@@ -230,19 +296,21 @@ class MainWindow:
             if not val.isdigit() or int(val) <= 0:
                 self.log("请输入有效的正整数分钟数", "err")
                 return
-            ok, msg = self.shutdown.schedule_countdown(int(val))
+            ok, msg, level = self.shutdown.schedule_countdown(int(val))
             tip = "将在 {} 分钟后关机".format(val)
         elif mode == self.MODE_TIMEPOINT:
-            ok, msg = self.shutdown.schedule_at_time(val)
+            ok, msg, level = self.shutdown.schedule_at_time(val)
             tip = "将在 {} 关机".format(val)
         else:
-            ok, msg = self.shutdown.schedule_daily(val)
+            ok, msg, level = self.shutdown.schedule_daily(val)
             tip = "每日 {} 自动关机".format(val)
-            self.config.set("daily_enabled", True)
-            self.config.set("shutdown_time", val)
+            if ok:
+                self.config.set("daily_enabled", True)
+                self.config.set("shutdown_time", val)
 
         if ok:
-            self.log("{}。如需取消请点击“取消关机”。".format(tip), "ok")
+            display_msg = msg if level == "warn" else "{}。如需取消请点击“取消关机”。".format(tip)
+            self.log(display_msg, level)
         else:
             self.log(msg, "err")
 

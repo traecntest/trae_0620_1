@@ -3,6 +3,7 @@ import glob
 import shutil
 import ctypes
 import tempfile
+import threading
 
 
 class Cleaner:
@@ -10,6 +11,7 @@ class Cleaner:
 
     清理范围：用户/系统临时文件、预读取文件、浏览器缓存、应用日志、回收站。
     安全策略：仅清理预定义目标目录内部内容，保留目录本身；通过允许根校验防止误删。
+    交互支持：支持暂停/取消，按类别返回统计结果。
     """
 
     # 绝不允许删除的系统关键位置（路径片段匹配）
@@ -32,6 +34,45 @@ class Cleaner:
         self.after_size = 0
         self.deleted_count = 0
         self.errors = []
+        self.category_results = []
+
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+        self._cancel_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def pause(self):
+        self._pause_event.clear()
+
+    def resume(self):
+        self._pause_event.set()
+
+    def is_paused(self):
+        return not self._pause_event.is_set()
+
+    def cancel(self):
+        self._cancel_event.set()
+        self._pause_event.set()
+
+    def is_cancelled(self):
+        return self._cancel_event.is_set()
+
+    def reset(self):
+        self._cancel_event.clear()
+        self._pause_event.set()
+        self.before_size = 0
+        self.after_size = 0
+        self.deleted_count = 0
+        self.errors = []
+        self.category_results = []
+
+    def _check_cancel_pause(self):
+        if self._cancel_event.is_set():
+            return False
+        self._pause_event.wait()
+        if self._cancel_event.is_set():
+            return False
+        return True
 
     @classmethod
     def _allowed_roots(cls):
@@ -161,15 +202,49 @@ class Cleaner:
 
     def scan(self):
         self.before_size = 0
+        self.category_results = []
         for name, kind, path in self.get_targets():
-            self.before_size += self._target_size(kind, path)
+            size = self._target_size(kind, path)
+            self.before_size += size
+            self.category_results.append({
+                "name": name,
+                "kind": kind,
+                "path": path,
+                "before_size": size,
+                "freed": 0,
+                "count": 0,
+                "status": "pending"
+            })
         return self.before_size
+
+    def get_category_summary(self):
+        grouped = {}
+        for cat in self.category_results:
+            name = cat["name"]
+            if name not in grouped:
+                grouped[name] = {"before": 0, "freed": 0, "count": 0, "status": "pending"}
+            grouped[name]["before"] += cat["before_size"]
+            grouped[name]["freed"] += cat["freed"]
+            grouped[name]["count"] += cat["count"]
+            grouped[name]["status"] = cat["status"]
+        return grouped
 
     def clean(self, progress_callback=None):
         self.errors = []
         self.deleted_count = 0
         freed = 0
-        for name, kind, path in self.get_targets():
+        if not self.category_results:
+            self.scan()
+
+        for cat in self.category_results:
+            if not self._check_cancel_pause():
+                cat["status"] = "cancelled"
+                break
+
+            name = cat["name"]
+            kind = cat["kind"]
+            path = cat["path"]
+
             try:
                 if kind == "recycle":
                     before = self._recycle_bin_size()[0]
@@ -178,24 +253,49 @@ class Cleaner:
                     delta = max(before - after, 0)
                     freed += delta
                     self.deleted_count += 1
+                    cat["freed"] += delta
+                    cat["count"] += 1
+                    cat["status"] = "done"
                     if progress_callback:
-                        progress_callback(name, delta)
+                        progress_callback(name, delta, 1)
                     continue
 
                 if not self._safe_to_clean(path):
                     self.errors.append("{}：路径不在允许范围，已跳过".format(name))
+                    cat["status"] = "skipped"
                     continue
 
                 # 浏览器目录：仅清理 Cache 子目录
                 if self._is_browser_user_data(path) and path.lower().endswith("user data"):
+                    total_freed = 0
+                    total_count = 0
                     for cache_dir in self._browser_cache_dirs(path):
+                        if not self._check_cancel_pause():
+                            break
                         if self._safe_to_clean(cache_dir):
-                            freed += self._clear_dir(cache_dir, progress_callback, name)
+                            f, c = self._clear_dir(cache_dir, progress_callback, name)
+                            total_freed += f
+                            total_count += c
+                    freed += total_freed
+                    cat["freed"] += total_freed
+                    cat["count"] += total_count
+                    cat["status"] = "done" if not self._cancel_event.is_set() else "cancelled"
                     continue
 
-                freed += self._clear_dir(path, progress_callback, name)
+                f, c = self._clear_dir(path, progress_callback, name)
+                freed += f
+                cat["freed"] += f
+                cat["count"] += c
+                cat["status"] = "done"
+
             except Exception as e:
                 self.errors.append("{}：{}".format(name, str(e)))
+                cat["status"] = "error"
+
+        if self._cancel_event.is_set():
+            for cat in self.category_results:
+                if cat["status"] == "pending":
+                    cat["status"] = "cancelled"
 
         self.after_size = self.before_size - freed
         if self.after_size < 0:
@@ -204,33 +304,40 @@ class Cleaner:
 
     def _clear_dir(self, path, progress_callback=None, name=""):
         freed = 0
+        count = 0
         if not path or not os.path.isdir(path):
-            return freed
+            return freed, count
         try:
             entries = list(os.scandir(path))
         except (OSError, PermissionError):
-            return freed
+            return freed, count
+        check_every = 20
+        i = 0
         for entry in entries:
+            i += 1
+            if i % check_every == 0:
+                if not self._check_cancel_pause():
+                    return freed, count
             try:
                 if entry.is_dir(follow_symlinks=False):
                     size = self._get_dir_size(entry.path)
                     shutil.rmtree(entry.path, ignore_errors=True)
                     if not os.path.exists(entry.path):
                         freed += size
-                        self.deleted_count += 1
+                        count += 1
                 elif entry.is_file(follow_symlinks=False):
                     size = entry.stat(follow_symlinks=False).st_size
                     try:
                         os.remove(entry.path)
                         freed += size
-                        self.deleted_count += 1
+                        count += 1
                     except (OSError, PermissionError):
                         pass
             except (OSError, PermissionError):
                 continue
-        if progress_callback:
-            progress_callback(name, freed)
-        return freed
+        if progress_callback and freed > 0:
+            progress_callback(name, freed, count)
+        return freed, count
 
     @staticmethod
     def _recycle_bin_size():

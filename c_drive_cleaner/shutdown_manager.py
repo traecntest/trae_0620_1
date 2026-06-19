@@ -9,29 +9,45 @@ class ShutdownManager:
     DAILY_TASK_NAME = "CDriveCleanerDailyShutdown"
 
     def schedule_countdown(self, minutes):
-        """倒计时关机：minutes 分钟后关机。"""
+        """倒计时关机：minutes 分钟后关机。
+
+        返回 (ok, msg, level)。
+        """
         seconds = max(int(minutes) * 60, 0)
-        return self._run_shutdown(["/s", "/t", str(seconds)])
+        ok, msg = self._run_shutdown(["/s", "/t", str(seconds)])
+        return ok, msg, "ok" if ok else "err"
 
     def schedule_at_time(self, time_str):
-        """指定时间点关机，例如 '22:30'。"""
+        """指定时间点关机，例如 '22:30'。若今日已过则顺延至次日。
+
+        返回 (ok, msg, level)，level 取值 ok / warn / err。
+        """
         seconds = self._seconds_until(time_str)
         if seconds is None:
-            return False, "时间格式不正确，请使用 HH:MM"
-        if seconds <= 0:
+            return False, "时间格式不正确，请使用 HH:MM", "err"
+        is_past = seconds <= 0
+        if is_past:
             seconds += 24 * 3600
-        return self._run_shutdown(["/s", "/t", str(seconds)])
+        ok, msg = self._run_shutdown(["/s", "/t", str(seconds)])
+        if ok and is_past:
+            msg = "注意：指定时间今日已过，将于明日 {} 关机。" + time_str
+            return True, msg, "warn"
+        return ok, msg, "ok" if ok else "err"
 
     def schedule_daily(self, time_str):
-        """每日循环关机，通过 Windows 计划任务实现。"""
+        """每日循环关机，通过 Windows 计划任务实现。
+
+        返回 (ok, msg, level)。
+        """
         if not self._valid_time(time_str):
-            return False, "时间格式不正确，请使用 HH:MM"
+            return False, "时间格式不正确，请使用 HH:MM", "err"
         self.cancel_daily()
         cmd = [
             "schtasks", "/Create", "/TN", self.DAILY_TASK_NAME,
             "/TR", "shutdown /s /f", "/SC", "DAILY", "/ST", time_str, "/F"
         ]
-        return self._run_raw(cmd)
+        ok, msg = self._run_raw(cmd)
+        return ok, msg, "ok" if ok else "err"
 
     def cancel(self):
         """取消所有由本工具设置的关机任务。"""
